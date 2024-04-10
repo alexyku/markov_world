@@ -21,13 +21,13 @@ class PCSW:
       self,
       rng,
       num_worlds=5,
-      num_contexts=10,
-      num_hidden=10,
+      num_contexts=5,
+      num_hidden=100,
       num_vocab=50,
       num_permutations=100,
       alpha=0.1,
       identity_prior=0.9,
-      emission_mode='default',
+      emission_mode='hidden',
   ):
     """PCSW dataset constructor.
 
@@ -42,12 +42,11 @@ class PCSW:
       num_permutations: Number of permutations sampling transition matrices.
       alpha: Dirichlet alpha for sampling entity and property matrices.
       identity_prior: Identity prior for entity matrix.
-      emission_mode: Emission distribution is shared  between worlds. In the
-        'default' condition, any context-hidden state can map to any token. In
-        the 'aliased' condition, tokens are non-overlapping between contexts --
-        therefore, the token fully determines the context.
+      emission_mode: Whether the emission distribution is conditioned on solely
+        on 'hidden' or both 'hidden_and_context'. When emission mode is
+        'hidden', the model is a true hierarchical hidden Markov model.
     """
-    init_rng, context_rng, state_rng, emission_rng = jax.random.split(rng, 4)
+    context_rng, state_rng, emission_rng = jax.random.split(rng, 3)
 
     self.num_worlds = num_worlds
     self.num_contexts = num_contexts
@@ -56,22 +55,23 @@ class PCSW:
     self.alpha = alpha
     self.identity_prior = identity_prior
 
-    # Initial distributions are unqiue for each world.
-    # transition_inits: [num_worlds, num_contexts * num_hidden]
-    self.world_inits = jax.random.dirichlet(
-        init_rng,
-        alpha=jnp.full(num_contexts * num_hidden, alpha),
-        shape=[num_worlds],
-    )
+    # Uniform initial distributions.
+    # init: [num_worlds, num_contexts * num_hidden]
+    self.uniform_init = jnp.ones([num_contexts * num_hidden], dtype=jnp.float32)
+    self.uniform_init /= self.uniform_init.sum()
 
     # Context dynamics are unqiue between world.
     # context_matrices: [num_worlds, num_contexts, num_contexts]
-    self.context_matrices = vmap_partial(
+    context_matrices_without_prior = vmap_partial(
         markov.sample_convex_combination_of_permutation_matrices,
         size=num_contexts,
         num_permutations=num_permutations,
         alpha=alpha,
     )(jax.random.split(context_rng, num_worlds))
+    self.context_matrices = jax.vmap(
+        lambda context_matrix: identity_prior * jnp.eye(num_contexts)
+        + (1 - identity_prior) * context_matrix
+    )(context_matrices_without_prior)
 
     # Hidden state dynamics are shared between worlds.
     # hidden_state_matrices: [num_contexts, num_hidden, num_hidden]
@@ -90,30 +90,28 @@ class PCSW:
     )(outer=self.context_matrices)
 
     # Emission distributions are shared between worlds.
-    # emission_dist: [num_contexts * num_hidden, num_vocab]
-    if emission_mode == 'default':
+    if emission_mode == 'hidden':
+      # Emissions only depend on hidden states.
+      vocab_lut = jnp.tile(
+          jax.random.randint(
+              emission_rng,
+              minval=0,
+              maxval=num_vocab,
+              shape=[num_hidden],
+          ),
+          num_contexts,
+      )
+    elif emission_mode == 'hidden_and_context':
+      # Emissions depend on hidden states and context.
       vocab_lut = jax.random.randint(
           emission_rng,
           minval=0,
           maxval=num_vocab,
           shape=[num_contexts * num_hidden],
       )
-    elif emission_mode == 'aliased':
-      # In the aliased condition, emitted tokens is non-overlapping between
-      # contexts.
-      sub_vocab, ragged = divmod(num_vocab, num_contexts)
-      assert not ragged, 'num_vocab must be divisible by num_contexts.'
-      vocab_lut = jax.random.randint(
-          emission_rng,
-          minval=0,
-          maxval=sub_vocab,
-          shape=[num_contexts, num_hidden],
-      )
-      # Shift sub-vocabularies to be non-overlapping between contexts.
-      vocab_lut += jnp.arange(num_contexts)[:, None] * sub_vocab
-      vocab_lut = jnp.reshape(vocab_lut, [num_contexts * num_hidden])
     else:
       raise ValueError(f'Unknown emission mode: {emission_mode}')
+    # vocab_categorical: [num_contexts * num_hidden, num_vocab]
     self.vocab_categorical = jax.nn.one_hot(vocab_lut, num_vocab)
 
   def _sample_sequence(self, rng, world, sequence_length):
@@ -121,7 +119,7 @@ class PCSW:
     contextual_states, emissions = (
         markov.sample_categorical_hidden_markov_model(
             rng,
-            init=self.world_inits[world],
+            init=self.uniform_init,
             matrix=self.world_matrices[world],
             categorical=self.vocab_categorical,
             num_steps=sequence_length,

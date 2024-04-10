@@ -68,7 +68,6 @@ class GINC:
       num_vocab=50,
       alpha=0.1,
       identity_prior=0.9,
-      emission_mode='default',
   ):
     """GINC dataset constructor.
 
@@ -82,7 +81,6 @@ class GINC:
       num_vocab: Integer. Number of vocabulary.
       alpha: Float. Dirichlet alpha for sampling entity and property matrices.
       identity_prior: Float. Identity prior for entity matrix.
-      emission_mode: String. Emission mode: 'default', 'aliased'
     """
     init_rng, matrix_rng, emission_rng = jax.random.split(rng, 3)
 
@@ -116,32 +114,13 @@ class GINC:
 
     # Emission distribution is shared between concepts.
     # vocab_categorical: [num_entities * num_properties, num_vocab]
-    if emission_mode == 'default':
-      # Vocabulary lookup table mapping entity-property state to tokens.
-      vocab_lut = jax.random.randint(
-          emission_rng,
-          minval=1,  # Let 0 be the delimiter token.
-          maxval=num_vocab,
-          shape=[num_entities * num_properties],
-      )
-    elif emission_mode == 'aliased':
-      # In the aliased emission setting, the vocabulary is non-overlapping
-      # between entities. This means that the entity is no longer latent, since
-      # the token fully determines the entity.
-      assert (num_vocab - 1) % num_entities == 0  # Don't waste tokens!
-      sub_vocab = (num_vocab - 1) // num_entities
-      vocab_lut = jax.random.randint(
-          emission_rng,
-          minval=0,
-          maxval=sub_vocab,
-          shape=[num_entities, num_properties],
-      )
-      # Shift vocabulary to be non-overlapping.
-      # Add one to let 0 be the delimiter token.
-      vocab_lut += jnp.arange(num_entities)[:, None] * sub_vocab + 1
-      vocab_lut = jnp.reshape(vocab_lut, [num_entities * num_properties])
-    else:
-      raise ValueError(f'Unknown emission mode: {emission_mode}')
+    # Vocabulary lookup table mapping entity-property state to tokens.
+    vocab_lut = jax.random.randint(
+        emission_rng,
+        minval=1,  # Let 0 be the delimiter token.
+        maxval=num_vocab,
+        shape=[num_entities * num_properties],
+    )
     self.vocab_categorical = jax.nn.one_hot(vocab_lut, num_vocab)
 
   def _sample_document(self, rng, document_length):
